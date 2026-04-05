@@ -1,0 +1,29 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lsm
+  namespace: lsm
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: lsm
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: lsm
+          image: ghcr.io/seif/lsm:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: LSM_DATA_DIR
+              value: /var/lib/lsm
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/lsm
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: lsm-data

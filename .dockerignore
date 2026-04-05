@@ -1,0 +1,5 @@
+target
+.git
+.gitignore
+.DS_Store
+k8s/*.local.yaml
