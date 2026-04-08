@@ -37,9 +37,9 @@ criterion = "0.8"           # Industry-standard microbenchmarking framework
 
 # Configure the benchmarking harness
 
-# [[bench]]
-# name = "lsm_bench"
-# harness = false
+[[bench]]
+name = "memtable_bench"
+harness = false
 
 # Optimize the release profile for maximum database throughput
 [profile.release]
