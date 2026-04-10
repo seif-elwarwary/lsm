@@ -1,0 +1,3 @@
+[submodule "libs/crossbeam"]
+	path = libs/crossbeam
+	url = https://github.com/crossbeam-rs/crossbeam.git
