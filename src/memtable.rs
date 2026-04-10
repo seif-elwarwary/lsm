@@ -65,7 +65,7 @@ impl MemTableEntry {
         })
     }
 
-    fn to_lookup_result(&self) -> LookupResult {
+    pub(crate) fn to_lookup_result(&self) -> LookupResult {
         match &self.value {
             Some(value) => LookupResult::Value(value.clone()),
             None => LookupResult::NotFound,
@@ -126,10 +126,10 @@ impl MemTable {
         self.upsert_entry(key, entry)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get(&self, key: &str) -> LookupResult {
-        self.entries
-            .get(key)
-            .map(|entry| entry.value().to_lookup_result())
+        self.get_entry(key)
+            .map(|entry| entry.to_lookup_result())
             .unwrap_or(LookupResult::NotFound)
     }
 
@@ -153,6 +153,18 @@ impl MemTable {
 
     pub fn remaining_bytes(&self) -> usize {
         MEMTABLE_CAPACITY_BYTES.saturating_sub(self.used_bytes())
+    }
+
+    pub(crate) fn get_entry(&self, key: &str) -> Option<MemTableEntry> {
+        self.entries.get(key).map(|entry| entry.value().clone())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn entries_snapshot(&self) -> Vec<(String, MemTableEntry)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
     }
 
     fn upsert_entry(&self, key: String, entry: MemTableEntry) -> Result<(), MemTableError> {
@@ -411,6 +423,27 @@ mod tests {
             LookupResult::Value(_) | LookupResult::NotFound
         ));
         assert!(memtable.used_bytes() <= MEMTABLE_CAPACITY_BYTES);
+    }
+
+    #[test]
+    fn entries_snapshot_is_sorted_and_preserves_tombstones() {
+        let memtable = MemTable::new();
+
+        memtable.put("beta", "two").unwrap();
+        memtable.put("alpha", "one").unwrap();
+        memtable.delete("beta").unwrap();
+
+        let snapshot = memtable.entries_snapshot();
+
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].0, "alpha");
+        assert_eq!(
+            snapshot[0].1.to_lookup_result(),
+            LookupResult::Value("one".into())
+        );
+        assert_eq!(snapshot[1].0, "beta");
+        assert!(snapshot[1].1.is_tombstone);
+        assert_eq!(snapshot[1].1.to_lookup_result(), LookupResult::NotFound);
     }
 
     mod loom_model_tests {
