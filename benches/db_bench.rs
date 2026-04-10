@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lsm::{LookupResult, MemTable};
+use lsm::{Db, LookupResult};
 
 const KEY_BYTES: usize = 24;
 const VALUE_BYTES: usize = 128;
@@ -44,15 +44,15 @@ fn p99_ns(latencies: &mut [u64]) -> u64 {
 }
 
 fn run_read_heavy_workload(thread_count: usize, ops_per_thread: usize) -> WorkloadSummary {
-    let memtable = Arc::new(MemTable::new());
+    let db = Arc::new(Db::open());
     for index in 0..READ_HEAVY_KEYSPACE {
-        memtable.put(fixed_key(index), fixed_value(index)).unwrap();
+        db.put(fixed_key(index), fixed_value(index)).unwrap();
     }
 
     let started_at = Instant::now();
     let handles: Vec<_> = (0..thread_count)
         .map(|thread_index| {
-            let memtable = Arc::clone(&memtable);
+            let db = Arc::clone(&db);
             thread::spawn(move || {
                 let mut latencies = Vec::with_capacity(ops_per_thread);
 
@@ -63,11 +63,10 @@ fn run_read_heavy_workload(thread_count: usize, ops_per_thread: usize) -> Worklo
                     let started = Instant::now();
 
                     if op_index % 10 == 0 {
-                        memtable
-                            .put(key, fixed_value(thread_index * 10_000 + op_index))
+                        db.put(key, fixed_value(thread_index * 10_000 + op_index))
                             .unwrap();
                     } else {
-                        match memtable.get(&key) {
+                        match db.get(&key).unwrap() {
                             LookupResult::Value(_) | LookupResult::NotFound => {}
                         }
                     }
@@ -96,12 +95,12 @@ fn run_read_heavy_workload(thread_count: usize, ops_per_thread: usize) -> Worklo
 }
 
 fn run_write_only_workload(thread_count: usize, ops_per_thread: usize) -> WorkloadSummary {
-    let memtable = Arc::new(MemTable::new());
+    let db = Arc::new(Db::open());
     let started_at = Instant::now();
 
     let handles: Vec<_> = (0..thread_count)
         .map(|thread_index| {
-            let memtable = Arc::clone(&memtable);
+            let db = Arc::clone(&db);
             thread::spawn(move || {
                 let mut latencies = Vec::with_capacity(ops_per_thread);
 
@@ -109,7 +108,7 @@ fn run_write_only_workload(thread_count: usize, ops_per_thread: usize) -> Worklo
                     let global_index = thread_index * ops_per_thread + op_index;
                     let key = fixed_key(global_index);
                     let started = Instant::now();
-                    memtable.put(key, fixed_value(global_index)).unwrap();
+                    db.put(key, fixed_value(global_index)).unwrap();
                     latencies.push(started.elapsed().as_nanos() as u64);
                 }
 
@@ -134,13 +133,13 @@ fn run_write_only_workload(thread_count: usize, ops_per_thread: usize) -> Worklo
 }
 
 fn bench_read_heavy(c: &mut Criterion) {
-    let mut group = c.benchmark_group("memtable_90_read_10_write");
+    let mut group = c.benchmark_group("db_90_read_10_write");
     group.sample_size(10);
 
     for &thread_count in &READ_HEAVY_THREADS {
         let summary = run_read_heavy_workload(thread_count, READ_HEAVY_OPS_PER_THREAD);
         println!(
-            "[memtable_90_read_10_write/{thread_count}_threads] qps={:.2}, p99={}ns, total_ops={}, elapsed={:?}",
+            "[db_90_read_10_write/{thread_count}_threads] qps={:.2}, p99={}ns, total_ops={}, elapsed={:?}",
             summary.qps, summary.p99_ns, summary.total_ops, summary.elapsed
         );
 
@@ -167,13 +166,13 @@ fn bench_read_heavy(c: &mut Criterion) {
 }
 
 fn bench_write_only(c: &mut Criterion) {
-    let mut group = c.benchmark_group("memtable_100_write");
+    let mut group = c.benchmark_group("db_100_write");
     group.sample_size(10);
 
     for &thread_count in &WRITE_ONLY_THREADS {
         let summary = run_write_only_workload(thread_count, WRITE_ONLY_OPS_PER_THREAD);
         println!(
-            "[memtable_100_write/{thread_count}_threads] qps={:.2}, p99={}ns, total_ops={}, elapsed={:?}",
+            "[db_100_write/{thread_count}_threads] qps={:.2}, p99={}ns, total_ops={}, elapsed={:?}",
             summary.qps, summary.p99_ns, summary.total_ops, summary.elapsed
         );
 
@@ -199,5 +198,5 @@ fn bench_write_only(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(memtable_benches, bench_read_heavy, bench_write_only);
-criterion_main!(memtable_benches);
+criterion_group!(db_benches, bench_read_heavy, bench_write_only);
+criterion_main!(db_benches);

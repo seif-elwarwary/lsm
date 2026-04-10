@@ -38,7 +38,7 @@ criterion = "0.8"           # Industry-standard microbenchmarking framework
 # Configure the benchmarking harness
 
 [[bench]]
-name = "memtable_bench"
+name = "db_bench"
 harness = false
 
 # Optimize the release profile for maximum database throughput
