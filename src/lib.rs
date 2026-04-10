@@ -1,3 +1,5 @@
-pub mod memtable;
+mod memtable;
+pub mod db;
 
-pub use memtable::{LookupResult, MemTable, MemTableEntry, MemTableError};
+pub use db::{Db, DbError};
+pub use memtable::LookupResult;
