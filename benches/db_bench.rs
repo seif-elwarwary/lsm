@@ -44,7 +44,7 @@ fn p99_ns(latencies: &mut [u64]) -> u64 {
 }
 
 fn run_read_heavy_workload(thread_count: usize, ops_per_thread: usize) -> WorkloadSummary {
-    let db = Arc::new(Db::open());
+    let db = Arc::new(Db::open("./db").unwrap());
     for index in 0..READ_HEAVY_KEYSPACE {
         db.put(fixed_key(index), fixed_value(index)).unwrap();
     }
@@ -95,7 +95,7 @@ fn run_read_heavy_workload(thread_count: usize, ops_per_thread: usize) -> Worklo
 }
 
 fn run_write_only_workload(thread_count: usize, ops_per_thread: usize) -> WorkloadSummary {
-    let db = Arc::new(Db::open());
+    let db = Arc::new(Db::open("./db").unwrap());
     let started_at = Instant::now();
 
     let handles: Vec<_> = (0..thread_count)

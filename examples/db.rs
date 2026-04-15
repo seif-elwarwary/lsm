@@ -1,7 +1,7 @@
 use lsm::{Db, LookupResult};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Db::open();
+    let db = Db::open("./db")?;
 
     println!("db opened");
     println!("is empty: {}", db.is_empty()?);
