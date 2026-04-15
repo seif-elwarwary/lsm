@@ -467,6 +467,8 @@ dependencies = [
  "crossbeam-skiplist",
  "loom",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

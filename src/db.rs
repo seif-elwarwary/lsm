@@ -1,14 +1,20 @@
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 use thiserror::Error;
 
+use crate::catalog::{Catalog, CatalogEntry, CatalogError};
 use crate::memtable::{LookupResult, MemTable, MemTableError};
+use crate::sstable::{SstableError, SstableReader, SstableWriter};
+
+const SSTABLE_SUBDIR: &str = "sst";
 
 #[derive(Debug)]
 pub struct Db {
+    db_path: PathBuf,
     state: RwLock<DbState>,
     is_open: AtomicBool,
 }
@@ -17,23 +23,29 @@ pub struct Db {
 struct DbState {
     writable_memtable: Arc<MemTable>,
     immutable_memtables: VecDeque<Arc<MemTable>>,
-}
-
-impl Default for Db {
-    fn default() -> Self {
-        Self::open()
-    }
+    catalog: Catalog,
 }
 
 impl Db {
-    pub fn open() -> Self {
-        Self {
+    /// Open (or create) a database rooted at `path`. The directory is created
+    /// if it does not exist; an existing `CATALOG.json` is loaded so previously
+    /// flushed SSTables remain readable.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let db_path = path.as_ref().to_owned();
+        std::fs::create_dir_all(&db_path)?;
+        std::fs::create_dir_all(db_path.join(SSTABLE_SUBDIR))?;
+
+        let catalog = Catalog::load_or_create(&db_path)?;
+
+        Ok(Self {
+            db_path,
             state: RwLock::new(DbState {
                 writable_memtable: Arc::new(MemTable::new()),
                 immutable_memtables: VecDeque::new(),
+                catalog,
             }),
             is_open: AtomicBool::new(true),
-        }
+        })
     }
 
     pub fn close(&self) -> Result<(), DbError> {
@@ -51,15 +63,40 @@ impl Db {
 
     pub fn get(&self, key: &str) -> Result<LookupResult, DbError> {
         self.ensure_open()?;
-        let (writable_memtable, immutable_memtables) = self.memtable_snapshot();
+
+        // Snapshot the read targets under the lock, then release it before
+        // doing any disk I/O. The immutable memtables and catalog entries
+        // are Arc-or-clone cheap to copy.
+        let (writable_memtable, immutable_memtables, l0_entries) = {
+            let state = self.state.read();
+            (
+                Arc::clone(&state.writable_memtable),
+                state
+                    .immutable_memtables
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                state.catalog.level0_entries().to_vec(),
+            )
+        };
 
         if let Some(entry) = writable_memtable.get_entry(key) {
             return Ok(entry.to_lookup_result());
         }
 
-        for memtable in immutable_memtables {
+        for memtable in &immutable_memtables {
             if let Some(entry) = memtable.get_entry(key) {
                 return Ok(entry.to_lookup_result());
+            }
+        }
+
+        // L0 SSTables: walk newest-first so the most recent tombstone or
+        // value for `key` wins.
+        for catalog_entry in &l0_entries {
+            let sst_path = self.db_path.join(&catalog_entry.path);
+            let reader = SstableReader::open(&sst_path)?;
+            if let Some(record) = reader.get(key)? {
+                return Ok(record.to_lookup_result());
             }
         }
 
@@ -107,7 +144,62 @@ impl Db {
         Ok(self.state.read().immutable_memtables.len())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn level0_sstable_count(&self) -> Result<usize, DbError> {
+        self.ensure_open()?;
+        Ok(self.state.read().catalog.level0_entries().len())
+    }
+
+    /// Flush the oldest immutable memtable to an L0 SSTable on disk.
+    ///
+    /// Returns `true` if something was flushed, `false` if there was nothing
+    /// to flush. Empty memtables are dropped without creating a file.
+    ///
+    /// The write sequence is:
+    ///   1. Pop the oldest immutable memtable (under the state lock)
+    ///   2. Reserve an SSTable id (under the state lock)
+    ///   3. Write the SSTable file (no lock held — this is the slow part)
+    ///   4. Register the SSTable in the catalog (under the state lock)
+    ///
+    /// Step 3 runs lock-free so concurrent reads/writes to memtables are
+    /// never blocked on disk I/O.
+    pub fn flush_oldest_immutable(&self) -> Result<bool, DbError> {
+        self.ensure_open()?;
+
+        let (memtable, sst_id) = {
+            let mut state = self.state.write();
+            let Some(memtable) = state.immutable_memtables.pop_back() else {
+                return Ok(false);
+            };
+            let sst_id = state.catalog.allocate_sst_id();
+            (memtable, sst_id)
+        };
+
+        if memtable.is_empty() {
+            return Ok(false);
+        }
+
+        let relative_path = format!("{SSTABLE_SUBDIR}/{sst_id:08}.sst");
+        let sst_path = self.db_path.join(&relative_path);
+
+        let mut writer = SstableWriter::create(&sst_path)?;
+        for (key, entry) in memtable.entries_snapshot() {
+            writer.write_entry(&key, &entry)?;
+        }
+        let meta = writer.finish()?;
+
+        let catalog_entry = CatalogEntry {
+            id: sst_id,
+            path: relative_path,
+            entry_count: meta.entry_count,
+            smallest_key: meta.smallest_key,
+            largest_key: meta.largest_key,
+            data_crc32: meta.data_crc32,
+        };
+
+        self.state.write().catalog.add_level0(catalog_entry)?;
+        Ok(true)
+    }
+
     pub(crate) fn pop_oldest_immutable_memtable(&self) -> Result<Option<Arc<MemTable>>, DbError> {
         self.ensure_open()?;
         Ok(self.state.write().immutable_memtables.pop_back())
@@ -183,11 +275,42 @@ pub enum DbError {
     Closed,
     #[error(transparent)]
     MemTable(#[from] MemTableError),
+    #[error("sstable error: {0}")]
+    Sst(String),
+    #[error("catalog error: {0}")]
+    Catalog(String),
+    #[error("I/O error: {0}")]
+    Io(String),
+}
+
+impl From<SstableError> for DbError {
+    fn from(e: SstableError) -> Self {
+        Self::Sst(e.to_string())
+    }
+}
+
+impl From<CatalogError> for DbError {
+    fn from(e: CatalogError) -> Self {
+        Self::Catalog(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for DbError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn open_test_db() -> (Db, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        (db, dir)
+    }
 
     fn fixed_string(byte_len: usize, fill: char) -> String {
         std::iter::repeat_n(fill, byte_len).collect()
@@ -195,7 +318,7 @@ mod tests {
 
     #[test]
     fn open_put_get_delete_close_round_trip_works() {
-        let db = Db::open();
+        let (db, _tmp) = open_test_db();
 
         assert!(db.is_empty().unwrap());
         db.put("alpha", "value").unwrap();
@@ -215,7 +338,7 @@ mod tests {
 
     #[test]
     fn operations_fail_after_close() {
-        let db = Db::open();
+        let (db, _tmp) = open_test_db();
         db.close().unwrap();
 
         assert_eq!(db.get("alpha").unwrap_err(), DbError::Closed);
@@ -227,7 +350,7 @@ mod tests {
 
     #[test]
     fn validation_errors_bubble_up_through_db() {
-        let db = Db::open();
+        let (db, _tmp) = open_test_db();
 
         assert_eq!(
             db.put("", "value").unwrap_err(),
@@ -237,7 +360,7 @@ mod tests {
 
     #[test]
     fn deleting_a_non_existent_key_creates_a_tombstone_and_returns_not_found() {
-        let db = Db::open();
+        let (db, _tmp) = open_test_db();
 
         db.delete("missing").unwrap();
 
@@ -247,7 +370,7 @@ mod tests {
 
     #[test]
     fn full_writable_memtable_rotates_without_losing_reads() {
-        let db = Db::open();
+        let (db, _tmp) = open_test_db();
         let value = fixed_string(
             crate::memtable::ENTRY_BUDGET_BYTES - crate::memtable::METADATA_OVERHEAD_BYTES - 8,
             'v',
@@ -277,7 +400,7 @@ mod tests {
 
     #[test]
     fn newer_tombstone_hides_older_value_across_memtables() {
-        let db = Db::open();
+        let (db, _tmp) = open_test_db();
 
         db.put("alpha", "value").unwrap();
         assert!(db.rotate_writable_memtable().is_some());
@@ -291,7 +414,7 @@ mod tests {
 
     #[test]
     fn immutable_memtables_are_popped_oldest_first_for_future_flushes() {
-        let db = Db::open();
+        let (db, _tmp) = open_test_db();
 
         db.put("alpha", "one").unwrap();
         db.rotate_writable_memtable().unwrap();
@@ -310,5 +433,93 @@ mod tests {
             vec![("beta".into(), next.get_entry("beta").unwrap(),)]
         );
         assert!(db.pop_oldest_immutable_memtable().unwrap().is_none());
+    }
+
+    #[test]
+    fn flush_writes_sstable_and_serves_reads_from_disk() {
+        let (db, _tmp) = open_test_db();
+
+        db.put("alpha", "one").unwrap();
+        db.put("beta", "two").unwrap();
+        db.put("gamma", "three").unwrap();
+        db.rotate_writable_memtable().unwrap();
+
+        assert!(db.flush_oldest_immutable().unwrap());
+        assert_eq!(db.immutable_memtable_count().unwrap(), 0);
+        assert_eq!(db.level0_sstable_count().unwrap(), 1);
+
+        assert_eq!(db.get("alpha").unwrap(), LookupResult::Value("one".into()));
+        assert_eq!(db.get("beta").unwrap(), LookupResult::Value("two".into()));
+        assert_eq!(
+            db.get("gamma").unwrap(),
+            LookupResult::Value("three".into())
+        );
+        assert_eq!(db.get("missing").unwrap(), LookupResult::NotFound);
+    }
+
+    #[test]
+    fn newer_sstable_tombstone_shadows_older_sstable_value() {
+        let (db, _tmp) = open_test_db();
+
+        db.put("alpha", "original").unwrap();
+        db.rotate_writable_memtable().unwrap();
+        assert!(db.flush_oldest_immutable().unwrap());
+
+        db.delete("alpha").unwrap();
+        db.rotate_writable_memtable().unwrap();
+        assert!(db.flush_oldest_immutable().unwrap());
+
+        assert_eq!(db.level0_sstable_count().unwrap(), 2);
+        assert_eq!(db.get("alpha").unwrap(), LookupResult::NotFound);
+    }
+
+    #[test]
+    fn flush_is_a_noop_when_no_immutable_memtables() {
+        let (db, _tmp) = open_test_db();
+        assert!(!db.flush_oldest_immutable().unwrap());
+    }
+
+    #[test]
+    fn reopening_a_db_recovers_flushed_sstables() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = Db::open(dir.path()).unwrap();
+            db.put("alpha", "one").unwrap();
+            db.put("beta", "two").unwrap();
+            db.rotate_writable_memtable().unwrap();
+            assert!(db.flush_oldest_immutable().unwrap());
+        }
+
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.level0_sstable_count().unwrap(), 1);
+        assert_eq!(db.get("alpha").unwrap(), LookupResult::Value("one".into()));
+        assert_eq!(db.get("beta").unwrap(), LookupResult::Value("two".into()));
+    }
+
+    #[test]
+    fn reopening_allocates_ids_after_the_highest_existing_sstable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = Db::open(dir.path()).unwrap();
+            db.put("alpha", "one").unwrap();
+            db.rotate_writable_memtable().unwrap();
+            db.flush_oldest_immutable().unwrap();
+            db.put("beta", "two").unwrap();
+            db.rotate_writable_memtable().unwrap();
+            db.flush_oldest_immutable().unwrap();
+        }
+
+        let db = Db::open(dir.path()).unwrap();
+        db.put("gamma", "three").unwrap();
+        db.rotate_writable_memtable().unwrap();
+        db.flush_oldest_immutable().unwrap();
+
+        // Three distinct SSTable files must exist: 00000001, 00000002, 00000003
+        for id in 1..=3u64 {
+            let sst_path = dir.path().join(format!("sst/{id:08}.sst"));
+            assert!(sst_path.exists(), "expected {sst_path:?} to exist");
+        }
     }
 }
