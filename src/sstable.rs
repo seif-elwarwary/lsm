@@ -161,6 +161,7 @@ pub struct SstableReader {
 }
 
 impl SstableReader {
+    // TODO: donot read the whole file into memory; instead, read the header, validate the key range, then read blocks on demand. We can add a sparse index in the header to speed this up.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, SstableError> {
         let mut file = File::open(path.as_ref())?;
         let mut data = Vec::new();
